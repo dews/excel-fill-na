@@ -1,0 +1,50 @@
+# Functional Spec
+
+## Goal
+
+Provide a reusable Python library that can:
+
+- open an Excel workbook
+- inspect a user-selected rectangular range
+- replace empty cells with a default value of `NA` or a user-provided string
+- optionally merge contiguous empty cells vertically within a column before filling them
+- save the processed workbook to a new file
+
+## Definitions
+
+- Empty cell: a cell whose value is `None` or a string containing only whitespace
+- Target range: the rectangular range selected by the caller, for example `A1:C20`
+- Excluded range: one or more rectangular ranges that should not be modified, even if they are inside the target range
+- Empty run: two or more contiguous empty cells in the same column inside the target range
+
+## Processing Rules
+
+1. The library loads the workbook from disk and selects either the requested worksheet or the active sheet.
+2. Only cells inside the target range are considered.
+3. Any cell inside an excluded range is skipped.
+4. If merge mode is disabled, each eligible empty cell is filled individually.
+5. If merge mode is enabled, each column is scanned top to bottom:
+   - an empty run of length 1 is filled normally
+   - an empty run of length 2 or more is merged vertically and filled via the top cell
+6. Existing merged ranges are respected:
+   - if the anchor cell of an existing merged range is inside the target range and is empty, it is filled
+   - the library does not expand, shrink, or replace an existing merged range
+
+## Output Rules
+
+- If no output path is supplied, the default output path is `<stem>.filled<suffix>`
+- The function returns a summary containing:
+  - sheet name
+  - target range
+  - fill value
+  - number of logical empty cells processed
+  - any merged ranges created by the library
+  - output path when saving to disk
+
+## Non-Goals
+
+- formula evaluation
+- `.xls` support
+- preserving user intent for partially selected existing merged ranges where the anchor lies outside the target range
+- horizontal merge generation
+

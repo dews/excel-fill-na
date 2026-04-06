@@ -9,7 +9,7 @@ description = "Fill empty Excel cells inside a selected range, with optional ver
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-  { name = "Codex" }
+  { name = "foxiris@gmail.com" }
 ]
 dependencies = [
   "openpyxl>=3.1,<4",

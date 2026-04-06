@@ -25,10 +25,11 @@ fna INPUT --range TARGET_RANGE [options]
 2. Resolve the worksheet using `--sheet` or the active sheet.
 3. Inspect the requested target range.
 4. Skip any cells contained by excluded ranges.
-5. Fill empty cells with `--fill-text`.
-6. If `--merge-empty-runs` is enabled, merge each contiguous vertical empty run before filling it.
-7. Save the updated workbook to the output path.
-8. Print a short processing summary to stdout.
+5. Preserve comment-only empty cells. They are not filled and are not included in merge runs.
+6. Fill the remaining eligible empty cells with `--fill-text`.
+7. If `--merge-empty-runs` is enabled, merge each contiguous vertical eligible empty run before filling it.
+8. Save the updated workbook to the output path by patching only the target worksheet XML and copying the rest of the workbook archive unchanged.
+9. Print a short processing summary to stdout.
 
 ## Exit Semantics
 

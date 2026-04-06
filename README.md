@@ -7,9 +7,12 @@ It supports:
 - filling empty cells with `NA` or custom text
 - skipping one or more excluded ranges
 - optionally merging contiguous empty cells vertically within a column before filling them
+- preserving comment-only cells without filling or merging them
 - working against the active worksheet or a named sheet
 
-The implementation uses `openpyxl`, so it supports `.xlsx` and `.xlsm` workbooks. `.xls` is not supported.
+The implementation uses `openpyxl` to inspect workbook contents and compute fill operations, then patches only the target worksheet XML inside the workbook archive when saving. That keeps existing drawings, charts, images, and other unsupported workbook parts intact instead of round-tripping the whole file through `openpyxl.save()`. `.xlsx` and `.xlsm` are supported. `.xls` is not supported.
+
+Pillow is not required to preserve existing workbook images. It is only relevant if you want to create new images through `openpyxl` itself. The committed test fixture under `tests/fixtures/` does not require Pillow at test runtime.
 
 ## Install
 
@@ -76,7 +79,17 @@ Example:
 - target range is `A1:A4`
 - merge mode creates `A1:A3` and fills `A1` with `NA`
 
-Existing merged cells are supported. If an existing merged range has an empty anchor cell, the anchor is filled, but the library does not attempt to re-merge or resize that existing merged range.
+Existing merged cells are supported. If an existing merged range has an eligible empty anchor cell, the anchor is filled, but the library does not attempt to re-merge or resize that existing merged range.
+
+## Comment behavior
+
+Only truly empty cells are modified. If a cell has no value but does have a comment, the library preserves that cell as-is:
+
+- it is not filled with `NA` or custom text
+- it is not included in a generated merge run
+- it breaks a vertical empty run when `merge_empty_runs=True`
+
+Cells that already contain a value are untouched regardless of whether they also have a comment.
 
 ## Specs
 

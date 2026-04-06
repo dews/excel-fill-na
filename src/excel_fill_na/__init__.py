@@ -1,4 +1,4 @@
-"""Public package interface for excel-fillna."""
+"""Public package interface for excel-fill-na."""
 
 from .core import DEFAULT_FILL_VALUE, FillResult, fill_empty_cells, process_workbook
 

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Use the `src/` layout. Package code lives in `src/excel_fillna/`: keep workbook logic in `core.py`, CLI argument handling in `cli.py`, and public exports in `__init__.py`. Tests live in `tests/`, with binary workbook fixtures under `tests/fixtures/`. Specs and behavior notes belong in `docs/` (`FUNCTIONAL_SPEC.md`, `CLI_SPEC.md`). Treat `build/` as generated output, not hand-edited source.
+Use the `src/` layout. Package code lives in `src/excel_fill_na/`: keep workbook logic in `core.py`, CLI argument handling in `cli.py`, and public exports in `__init__.py`. Tests live in `tests/`, with binary workbook fixtures under `tests/fixtures/`. Specs and behavior notes belong in `docs/` (`FUNCTIONAL_SPEC.md`, `CLI_SPEC.md`). Treat `build/` as generated output, not hand-edited source.
 
 ## Build, Test, and Development Commands
 Create or refresh a local environment with `python3 -m venv .venv` and install dependencies with `python3 -m pip install -e ".[dev]"`. Install the package normally with `python3 -m pip install .` when you want the `fna` console script available outside editable mode. Run the test suite with `python3 -m pytest`; this is the verified command for the current workspace. For quick manual checks, use the CLI directly, for example `fna workbook.xlsx --range A1:C20 --fill-text MISSING`.

@@ -4,7 +4,7 @@ from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
 
-from excel_fillna.cli import main
+from excel_fill_na.cli import main
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "preserved_artifacts.xlsx"
 ARTIFACT_PREFIXES = ("xl/drawings/", "xl/media/", "xl/charts/", "xl/richData/")

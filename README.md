@@ -1,6 +1,6 @@
-# excel-fillna
+# excel-fill-na
 
-`excel-fillna` is a small pip-installable library with an `fna` CLI for filling empty Excel cells inside a selected range.
+`excel-fill-na` is a small pip-installable library with an `fna` CLI for filling empty Excel cells inside a selected range.
 
 It supports:
 
@@ -53,7 +53,7 @@ fna workbook.xlsx \
 ## Python Usage
 
 ```python
-from excel_fillna import process_workbook
+from excel_fill_na import process_workbook
 
 result = process_workbook(
     "workbook.xlsx",

@@ -16,6 +16,14 @@ Pillow is not required to preserve existing workbook images. It is only relevant
 
 ## Install
 
+From PyPI:
+
+```bash
+pip install excel-fill-na
+```
+
+From a local checkout:
+
 ```bash
 pip install .
 ```

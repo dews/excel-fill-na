@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "excel-fill-na"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fill empty Excel cells inside a selected range, with optional vertical merge support."
 readme = "README.md"
 requires-python = ">=3.10"

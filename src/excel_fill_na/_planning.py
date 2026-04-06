@@ -63,7 +63,10 @@ def apply_fill_plan_to_worksheet(worksheet: Worksheet, plan: FillPlan) -> None:
 
 def resolve_worksheet(workbook: Workbook, sheet_name: str | None) -> Worksheet:
     if sheet_name is None:
-        return workbook.active
+        worksheet = workbook.active
+        if worksheet is None:
+            raise ValueError("Workbook has no active worksheet.")
+        return worksheet
     if sheet_name not in workbook.sheetnames:
         available = ", ".join(workbook.sheetnames)
         raise ValueError(f"Worksheet {sheet_name!r} was not found. Available sheets: {available}")

@@ -1,56 +1,12 @@
 from pathlib import Path
-import re
-from zipfile import ZipFile
-from zipfile import ZIP_DEFLATED
+from zipfile import ZipFile, ZIP_DEFLATED
 from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 
 from excel_fill_na.core import fill_empty_cells, process_workbook
-
-FIXTURE_PATH = Path(__file__).with_name("fixtures") / "preserved_artifacts.xlsx"
-ARTIFACT_PREFIXES = ("xl/drawings/", "xl/media/", "xl/charts/", "xl/richData/")
-ARTIFACT_FILES = {
-    "[Content_Types].xml",
-    "xl/_rels/workbook.xml.rels",
-    "xl/metadata.xml",
-    "xl/worksheets/_rels/sheet1.xml.rels",
-    "xl/drawings/_rels/drawing1.xml.rels",
-}
-
-
-def _artifact_payloads(path: Path) -> dict[str, bytes]:
-    with ZipFile(path) as archive:
-        return {
-            name: archive.read(name)
-            for name in sorted(archive.namelist())
-            if name.startswith(ARTIFACT_PREFIXES) or name in ARTIFACT_FILES
-        }
-
-
-def _root_namespace_declarations(path: Path, worksheet_path: str = "xl/worksheets/sheet1.xml") -> set[str]:
-    with ZipFile(path) as archive:
-        xml_text = archive.read(worksheet_path).decode("utf-8")
-
-    opening_tag_match = re.search(r"<([A-Za-z_][^>\s/]*)\b[^>]*>", xml_text)
-    assert opening_tag_match is not None
-    opening_tag = opening_tag_match.group(0)
-    return set(re.findall(r'xmlns(?::[A-Za-z_][\w.-]*)?="[^"]+"', opening_tag))
-
-
-def _worksheet_cell_xml(
-    path: Path,
-    coordinate: str,
-    worksheet_path: str = "xl/worksheets/sheet1.xml",
-) -> tuple[dict[str, str], str | None]:
-    with ZipFile(path) as archive:
-        sheet_root = ET.fromstring(archive.read(worksheet_path))
-
-    namespace = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    cell = sheet_root.find(f".//main:c[@r='{coordinate}']", namespace)
-    assert cell is not None
-    return dict(cell.attrib), cell.findtext("main:v", None, namespace)
+from conftest import FIXTURE_PATH, artifact_payloads, root_namespace_declarations, worksheet_cell_xml
 
 
 def _write_comment_only_workbook(path: Path) -> None:
@@ -271,13 +227,13 @@ def test_process_workbook_preserves_fixture_artifacts_and_styles(tmp_path: Path)
     assert len(getattr(output_worksheet, "_images", [])) == source_image_count
     assert len(getattr(output_worksheet, "_charts", [])) == source_chart_count
 
-    artifact_payloads = _artifact_payloads(output)
-    assert "xl/charts/chart1.xml" in artifact_payloads
-    assert "xl/richData/richValueRel.xml" in artifact_payloads
-    assert "xl/worksheets/_rels/sheet1.xml.rels" in artifact_payloads
-    assert artifact_payloads == _artifact_payloads(FIXTURE_PATH)
-    assert _root_namespace_declarations(output) == _root_namespace_declarations(FIXTURE_PATH)
-    cell_attributes, cell_value = _worksheet_cell_xml(output, "D3")
+    output_artifacts = artifact_payloads(output)
+    assert "xl/charts/chart1.xml" in output_artifacts
+    assert "xl/richData/richValueRel.xml" in output_artifacts
+    assert "xl/worksheets/_rels/sheet1.xml.rels" in output_artifacts
+    assert output_artifacts == artifact_payloads(FIXTURE_PATH)
+    assert root_namespace_declarations(output) == root_namespace_declarations(FIXTURE_PATH)
+    cell_attributes, cell_value = worksheet_cell_xml(output, "D3")
     assert cell_attributes["t"] == "e"
     assert cell_attributes["vm"] == "1"
     assert cell_value == "#VALUE!"
@@ -302,7 +258,7 @@ def test_process_workbook_targets_named_sheet_without_touching_other_sheets(tmp_
     assert output_workbook["Other"]["B2"].value == "FILLED"
     assert output_workbook["Data"]["B1"].value is None
     assert output_workbook["Data"]["C1"].value is None
-    assert _artifact_payloads(output) == _artifact_payloads(FIXTURE_PATH)
+    assert artifact_payloads(output) == artifact_payloads(FIXTURE_PATH)
 
 
 def test_process_workbook_does_not_merge_comment_only_cells(tmp_path: Path) -> None:
@@ -344,7 +300,7 @@ def test_process_workbook_does_not_fill_value_metadata_cells(tmp_path: Path) -> 
 
     output_workbook = load_workbook(output)
     output_worksheet = output_workbook["Data"]
-    cell_attributes, cell_value = _worksheet_cell_xml(output, "A2")
+    cell_attributes, cell_value = worksheet_cell_xml(output, "A2")
 
     assert result.filled_cells == 1
     assert result.merged_ranges == ()

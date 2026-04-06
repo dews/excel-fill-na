@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from .core import DEFAULT_FILL_VALUE, process_workbook
 
@@ -83,5 +84,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def cli_entry() -> None:
+    """Console-script entry point that propagates the exit code."""
+    sys.exit(main())
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    cli_entry()

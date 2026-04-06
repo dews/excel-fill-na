@@ -283,7 +283,7 @@ def set_inline_string_value(cell_element: ET.Element, value: str) -> None:
     preserved_attributes = {
         name: attribute_value
         for name, attribute_value in cell_element.attrib.items()
-        if name != "t"
+        if name not in ("t", "vm")
     }
 
     for child in list(cell_element):

@@ -9,7 +9,7 @@ from .core import DEFAULT_FILL_VALUE, process_workbook
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fna",
-        description="Fill empty Excel cells inside a selected range.",
+        description="Fill empty Excel cells or delete empty rows inside a selected range.",
     )
     parser.add_argument("input_path", help="Path to the source .xlsx or .xlsm workbook.")
     parser.add_argument(
@@ -36,13 +36,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-t",
         "--fill-text",
-        default=DEFAULT_FILL_VALUE,
         help="Replacement text for empty cells. Defaults to NA.",
     )
+    parser.set_defaults(fill_text=DEFAULT_FILL_VALUE)
     parser.add_argument(
         "--merge-empty-runs",
         action="store_true",
         help="Merge contiguous empty cells vertically within each column before filling them.",
+    )
+    parser.add_argument(
+        "--delete-empty-rows",
+        action="store_true",
+        help="Delete rows whose cells are all empty within the selected range.",
     )
     parser.add_argument(
         "-o",
@@ -55,7 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(raw_argv)
+    fill_text_explicit = any(
+        token == "--fill-text" or token.startswith("--fill-text=") or token == "-t"
+        for token in raw_argv
+    )
+
+    if args.delete_empty_rows and args.merge_empty_runs:
+        parser.error("--delete-empty-rows cannot be combined with --merge-empty-runs.")
+    if args.delete_empty_rows and fill_text_explicit:
+        parser.error("--delete-empty-rows cannot be combined with --fill-text.")
 
     try:
         result = process_workbook(
@@ -66,9 +81,15 @@ def main(argv: list[str] | None = None) -> int:
             merge_empty_runs=args.merge_empty_runs,
             sheet_name=args.sheet_name,
             output_path=args.output_path,
+            delete_empty_rows=args.delete_empty_rows,
         )
     except Exception as exc:
         parser.exit(2, f"error: {exc}\n")
+
+    if args.delete_empty_rows:
+        row_label = "row" if result.deleted_rows == 1 else "rows"
+        print(f"Wrote {result.output_path} | deleted {result.deleted_rows} empty {row_label}.")
+        return 0
 
     merged_count = len(result.merged_ranges)
     merged_label = "range" if merged_count == 1 else "ranges"

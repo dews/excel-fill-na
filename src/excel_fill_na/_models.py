@@ -14,6 +14,7 @@ class FillResult:
     filled_cells: int
     merged_ranges: tuple[str, ...]
     output_path: Path | None = None
+    deleted_rows: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,3 +32,4 @@ class FillPlan:
     filled_cells: int
     merged_ranges: tuple[str, ...]
     cell_writes: tuple[CellWrite, ...]
+    deleted_row_indices: tuple[int, ...] = ()

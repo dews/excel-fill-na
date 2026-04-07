@@ -12,7 +12,12 @@ from ._archive import (
     resolve_worksheet_archive_path,
 )
 from ._models import DEFAULT_FILL_VALUE, FillResult
-from ._planning import apply_fill_plan_to_worksheet, build_fill_plan, resolve_worksheet
+from ._planning import (
+    apply_fill_plan_to_worksheet,
+    build_delete_plan,
+    build_fill_plan,
+    resolve_worksheet,
+)
 
 FillResult.__module__ = __name__
 
@@ -26,8 +31,9 @@ def process_workbook(
     merge_empty_runs: bool = False,
     sheet_name: str | None = None,
     output_path: str | Path | None = None,
+    delete_empty_rows: bool = False,
 ) -> FillResult:
-    """Load a workbook, fill empty cells, and save the result."""
+    """Load a workbook, apply the requested operation, and save the result."""
     source = Path(input_path)
     if not source.exists():
         raise FileNotFoundError(f"Workbook not found: {source}")
@@ -45,14 +51,24 @@ def process_workbook(
     try:
         worksheet = resolve_worksheet(workbook, sheet_name)
         worksheet_path = resolve_worksheet_archive_path(source, worksheet.title)
-        plan = build_fill_plan(
-            worksheet,
-            target_range=target_range,
-            excluded_ranges=excluded_ranges,
-            fill_value=fill_value,
-            merge_empty_runs=merge_empty_runs,
-            preserved_coordinates=find_value_metadata_cells(source, worksheet_path),
-        )
+        preserved_coordinates = find_value_metadata_cells(source, worksheet_path)
+        if delete_empty_rows:
+            plan = build_delete_plan(
+                worksheet,
+                target_range=target_range,
+                excluded_ranges=excluded_ranges,
+                fill_value=fill_value,
+                preserved_coordinates=preserved_coordinates,
+            )
+        else:
+            plan = build_fill_plan(
+                worksheet,
+                target_range=target_range,
+                excluded_ranges=excluded_ranges,
+                fill_value=fill_value,
+                merge_empty_runs=merge_empty_runs,
+                preserved_coordinates=preserved_coordinates,
+            )
     finally:
         close = getattr(workbook, "close", None)
         if callable(close):
@@ -72,6 +88,7 @@ def process_workbook(
         filled_cells=plan.filled_cells,
         merged_ranges=plan.merged_ranges,
         output_path=destination,
+        deleted_rows=len(plan.deleted_row_indices),
     )
 
 

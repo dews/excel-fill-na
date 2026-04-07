@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from io import BytesIO
 from pathlib import Path
 import posixpath
@@ -20,7 +21,16 @@ from ._ranges import parse_range
 SPREADSHEETML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OFFICE_DOCUMENT_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+VML_NS = "urn:schemas-microsoft-com:vml"
+EXCEL_VML_NS = "urn:schemas-microsoft-com:office:excel"
+THREADED_COMMENTS_NS = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"
+THREADED_COMMENT_REL_NS = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
+COMMENTS_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/comments"
+DRAWING_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/drawing"
+VML_DRAWING_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/vmlDrawing"
 
 SHEET_NAMESPACES = {"main": SPREADSHEETML_NS}
 WORKBOOK_NAMESPACES = {
@@ -28,6 +38,7 @@ WORKBOOK_NAMESPACES = {
     "r": OFFICE_DOCUMENT_REL_NS,
     "rels": PACKAGE_REL_NS,
 }
+DRAWING_NAMESPACES = {"xdr": DRAWINGML_NS}
 
 
 def persist_workbook_changes(
@@ -38,7 +49,8 @@ def persist_workbook_changes(
     plan: FillPlan,
 ) -> None:
     same_path = source.resolve() == destination.resolve()
-    if not plan.cell_writes and not plan.merged_ranges:
+    has_changes = bool(plan.cell_writes or plan.merged_ranges or plan.deleted_row_indices)
+    if not has_changes:
         if same_path:
             return
         copyfile(source, destination)
@@ -149,15 +161,65 @@ def write_patched_archive(
     plan: FillPlan,
 ) -> None:
     with ZipFile(source) as source_archive:
-        worksheet_xml = source_archive.read(worksheet_path)
-        patched_worksheet_xml = patch_worksheet_xml(worksheet_xml, plan)
+        patched_parts = build_archive_patches(
+            source_archive=source_archive,
+            worksheet_path=worksheet_path,
+            plan=plan,
+        )
 
         with ZipFile(destination, "w") as destination_archive:
             for info in source_archive.infolist():
-                data = patched_worksheet_xml if info.filename == worksheet_path else source_archive.read(
-                    info.filename
-                )
+                data = patched_parts.get(info.filename, source_archive.read(info.filename))
                 destination_archive.writestr(info, data)
+
+
+def build_archive_patches(
+    *,
+    source_archive: ZipFile,
+    worksheet_path: str,
+    plan: FillPlan,
+) -> dict[str, bytes]:
+    patched_parts = {
+        worksheet_path: patch_worksheet_xml(source_archive.read(worksheet_path), plan),
+    }
+
+    if not plan.deleted_row_indices:
+        return patched_parts
+
+    related_part_paths = resolve_related_part_paths(source_archive, worksheet_path)
+    for path in related_part_paths.get(COMMENTS_REL_TYPE, ()):
+        patched_parts[path] = patch_comments_xml(source_archive.read(path), plan.deleted_row_indices)
+    for path in related_part_paths.get(THREADED_COMMENT_REL_NS, ()):
+        patched_parts[path] = patch_threaded_comments_xml(source_archive.read(path), plan.deleted_row_indices)
+    for path in related_part_paths.get(VML_DRAWING_REL_TYPE, ()):
+        patched_parts[path] = patch_vml_drawing_xml(source_archive.read(path), plan.deleted_row_indices)
+    for path in related_part_paths.get(DRAWING_REL_TYPE, ()):
+        patched_parts[path] = patch_drawing_xml(source_archive.read(path), plan.deleted_row_indices)
+
+    return patched_parts
+
+
+def resolve_related_part_paths(source_archive: ZipFile, worksheet_path: str) -> dict[str, tuple[str, ...]]:
+    relationships_path = relationship_part_path(worksheet_path)
+    try:
+        relationships_root = ET.fromstring(source_archive.read(relationships_path))
+    except KeyError:
+        return {}
+
+    paths_by_type: dict[str, list[str]] = {}
+    for relationship in relationships_root.findall(package_relationship_tag("Relationship")):
+        relationship_type = relationship.attrib.get("Type")
+        target = relationship.attrib.get("Target")
+        if not relationship_type or not target:
+            continue
+        paths_by_type.setdefault(relationship_type, []).append(
+            normalize_archive_path(worksheet_path, target)
+        )
+
+    return {
+        relationship_type: tuple(paths)
+        for relationship_type, paths in paths_by_type.items()
+    }
 
 
 def patch_worksheet_xml(worksheet_xml: bytes, plan: FillPlan) -> bytes:
@@ -167,6 +229,11 @@ def patch_worksheet_xml(worksheet_xml: bytes, plan: FillPlan) -> bytes:
     sheet_data = worksheet_root.find("main:sheetData", SHEET_NAMESPACES)
     if sheet_data is None:
         raise ValueError("Worksheet XML is missing sheetData.")
+
+    if plan.deleted_row_indices:
+        delete_rows_from_sheet_data(sheet_data, plan.deleted_row_indices)
+        patch_existing_merge_ranges(worksheet_root, plan.deleted_row_indices)
+        patch_worksheet_references(worksheet_root, plan.deleted_row_indices)
 
     row_lookup = {
         safe_int(row.attrib.get("r")): row
@@ -189,14 +256,237 @@ def patch_worksheet_xml(worksheet_xml: bytes, plan: FillPlan) -> bytes:
 
     update_dimension(worksheet_root, sheet_data, plan)
 
-    patched_xml = ET.tostring(worksheet_root, encoding="utf-8", xml_declaration=True)
-    return restore_root_namespace_declarations(patched_xml, namespaces)
+    return serialize_xml(
+        worksheet_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(worksheet_xml),
+    )
+
+
+def patch_comments_xml(comments_xml: bytes, deleted_row_indices: tuple[int, ...]) -> bytes:
+    comments_root, namespaces = parse_xml_bytes(comments_xml)
+    register_namespaces(namespaces)
+
+    comment_list = comments_root.find("main:commentList", SHEET_NAMESPACES)
+    if comment_list is not None:
+        for comment in list(comment_list.findall(sheet_tag("comment"))):
+            reference = comment.attrib.get("ref")
+            if not reference:
+                continue
+            shifted_reference = shift_single_coordinate(reference, deleted_row_indices)
+            if shifted_reference is None:
+                comment_list.remove(comment)
+                continue
+            comment.set("ref", shifted_reference)
+
+    return serialize_xml(
+        comments_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(comments_xml),
+    )
+
+
+def patch_threaded_comments_xml(
+    threaded_comments_xml: bytes,
+    deleted_row_indices: tuple[int, ...],
+) -> bytes:
+    threaded_root, namespaces = parse_xml_bytes(threaded_comments_xml)
+    register_namespaces(namespaces)
+
+    for threaded_comment in list(
+        threaded_root.findall(f"{{{THREADED_COMMENTS_NS}}}threadedComment")
+    ):
+        reference = threaded_comment.attrib.get("ref")
+        if not reference:
+            continue
+        shifted_reference = shift_single_coordinate(reference, deleted_row_indices)
+        if shifted_reference is None:
+            threaded_root.remove(threaded_comment)
+            continue
+        threaded_comment.set("ref", shifted_reference)
+
+    return serialize_xml(
+        threaded_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(threaded_comments_xml),
+    )
+
+
+def patch_vml_drawing_xml(vml_xml: bytes, deleted_row_indices: tuple[int, ...]) -> bytes:
+    vml_root, namespaces = parse_xml_bytes(vml_xml)
+    register_namespaces(namespaces)
+
+    for shape in list(vml_root):
+        if shape.tag != vml_tag("shape"):
+            continue
+
+        client_data = shape.find(excel_vml_tag("ClientData"))
+        if client_data is None or client_data.attrib.get("ObjectType") != "Note":
+            continue
+
+        row_element = client_data.find(excel_vml_tag("Row"))
+        if row_element is None or row_element.text is None:
+            continue
+
+        row_index = safe_int(row_element.text)
+        if row_index is None:
+            continue
+
+        shifted_row = shift_zero_based_row_marker(row_index, deleted_row_indices)
+        if shifted_row is None:
+            vml_root.remove(shape)
+            continue
+
+        row_element.text = str(shifted_row)
+
+        anchor = client_data.find(excel_vml_tag("Anchor"))
+        if anchor is not None and anchor.text:
+            anchor.text = shift_vml_anchor(anchor.text, deleted_row_indices)
+
+    return serialize_xml(
+        vml_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(vml_xml),
+    )
+
+
+def patch_drawing_xml(drawing_xml: bytes, deleted_row_indices: tuple[int, ...]) -> bytes:
+    drawing_root, namespaces = parse_xml_bytes(drawing_xml)
+    register_namespaces(namespaces)
+
+    for one_cell_anchor in drawing_root.findall("xdr:oneCellAnchor", DRAWING_NAMESPACES):
+        shift_drawing_marker(one_cell_anchor.find("xdr:from", DRAWING_NAMESPACES), deleted_row_indices)
+
+    for two_cell_anchor in drawing_root.findall("xdr:twoCellAnchor", DRAWING_NAMESPACES):
+        from_marker = two_cell_anchor.find("xdr:from", DRAWING_NAMESPACES)
+        to_marker = two_cell_anchor.find("xdr:to", DRAWING_NAMESPACES)
+        from_row = shift_drawing_marker(from_marker, deleted_row_indices)
+        to_row = shift_drawing_marker(to_marker, deleted_row_indices)
+        if from_row is not None and to_row is not None and to_row < from_row:
+            row_element = to_marker.find("xdr:row", DRAWING_NAMESPACES) if to_marker is not None else None
+            if row_element is not None:
+                row_element.text = str(from_row)
+
+    return serialize_xml(
+        drawing_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(drawing_xml),
+    )
+
+
+def delete_rows_from_sheet_data(sheet_data: ET.Element, deleted_row_indices: tuple[int, ...]) -> None:
+    for row_element in list(sheet_data.findall(sheet_tag("row"))):
+        row_index = safe_int(row_element.attrib.get("r"))
+        if row_index is None:
+            continue
+
+        shifted_row = shift_row_number(row_index, deleted_row_indices)
+        if shifted_row is None:
+            sheet_data.remove(row_element)
+            continue
+
+        row_element.set("r", str(shifted_row))
+        for cell_element in row_element.findall(sheet_tag("c")):
+            coordinate = cell_element.attrib.get("r")
+            if coordinate is None:
+                continue
+            shifted_coordinate = shift_single_coordinate(coordinate, deleted_row_indices)
+            if shifted_coordinate is not None:
+                cell_element.set("r", shifted_coordinate)
+        update_row_spans(row_element)
+
+
+def patch_existing_merge_ranges(worksheet_root: ET.Element, deleted_row_indices: tuple[int, ...]) -> None:
+    merge_cells = worksheet_root.find("main:mergeCells", SHEET_NAMESPACES)
+    if merge_cells is None:
+        return
+
+    for merge_cell in list(merge_cells.findall(sheet_tag("mergeCell"))):
+        reference = merge_cell.attrib.get("ref")
+        if not reference:
+            continue
+        shifted_bounds = shift_range_bounds(reference, deleted_row_indices)
+        if shifted_bounds is None or range_is_single_cell(shifted_bounds):
+            merge_cells.remove(merge_cell)
+            continue
+        merge_cell.set("ref", format_range_bounds(shifted_bounds))
+
+    if any(child.tag == sheet_tag("mergeCell") for child in merge_cells):
+        merge_cells.set(
+            "count",
+            str(sum(1 for child in merge_cells if child.tag == sheet_tag("mergeCell"))),
+        )
+        return
+
+    worksheet_root.remove(merge_cells)
+
+
+def patch_worksheet_references(worksheet_root: ET.Element, deleted_row_indices: tuple[int, ...]) -> None:
+    patch_hyperlinks(worksheet_root, deleted_row_indices)
+    patch_selection_references(worksheet_root, deleted_row_indices)
+
+
+def patch_hyperlinks(worksheet_root: ET.Element, deleted_row_indices: tuple[int, ...]) -> None:
+    hyperlinks = worksheet_root.find("main:hyperlinks", SHEET_NAMESPACES)
+    if hyperlinks is None:
+        return
+
+    for hyperlink in list(hyperlinks.findall(sheet_tag("hyperlink"))):
+        reference = hyperlink.attrib.get("ref")
+        if not reference:
+            continue
+        shifted_bounds = shift_range_bounds(reference, deleted_row_indices)
+        if shifted_bounds is None:
+            hyperlinks.remove(hyperlink)
+            continue
+        hyperlink.set("ref", format_range_bounds(shifted_bounds))
+
+    if not any(child.tag == sheet_tag("hyperlink") for child in hyperlinks):
+        worksheet_root.remove(hyperlinks)
+
+
+def patch_selection_references(worksheet_root: ET.Element, deleted_row_indices: tuple[int, ...]) -> None:
+    for selection in worksheet_root.findall(".//main:selection", SHEET_NAMESPACES):
+        active_cell = selection.attrib.get("activeCell")
+        if active_cell:
+            shifted_active_cell = shift_single_coordinate(active_cell, deleted_row_indices)
+            if shifted_active_cell is None:
+                selection.attrib.pop("activeCell", None)
+            else:
+                selection.set("activeCell", shifted_active_cell)
+
+        sqref = selection.attrib.get("sqref")
+        if sqref:
+            shifted_sqref = shift_reference_list(sqref, deleted_row_indices)
+            if shifted_sqref is None:
+                selection.attrib.pop("sqref", None)
+            else:
+                selection.set("sqref", shifted_sqref)
+
+
+def shift_reference_list(reference_list: str, deleted_row_indices: tuple[int, ...]) -> str | None:
+    shifted_references = [
+        format_range_bounds(shifted_bounds)
+        for reference in reference_list.split()
+        if (shifted_bounds := shift_range_bounds(reference, deleted_row_indices)) is not None
+    ]
+    if not shifted_references:
+        return None
+    return " ".join(shifted_references)
 
 
 def normalize_archive_path(base_path: str, target: str) -> str:
     if target.startswith("/"):
         return target.lstrip("/")
     return posixpath.normpath(posixpath.join(posixpath.dirname(base_path), target))
+
+
+def relationship_part_path(owner_path: str) -> str:
+    return posixpath.join(
+        posixpath.dirname(owner_path),
+        "_rels",
+        posixpath.basename(owner_path) + ".rels",
+    )
 
 
 def parse_xml_bytes(xml_bytes: bytes) -> tuple[ET.Element, list[tuple[str, str]]]:
@@ -211,7 +501,23 @@ def parse_xml_bytes(xml_bytes: bytes) -> tuple[ET.Element, list[tuple[str, str]]
 
 def register_namespaces(namespaces: Iterable[tuple[str, str]]) -> None:
     for prefix, uri in namespaces:
+        if re.match(r"ns\d+$", prefix):
+            continue
         ET.register_namespace(prefix, uri)
+
+
+def serialize_xml(
+    root: ET.Element,
+    namespaces: Iterable[tuple[str, str]],
+    *,
+    xml_declaration: bool,
+) -> bytes:
+    xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=xml_declaration)
+    return restore_root_namespace_declarations(xml_bytes, namespaces)
+
+
+def has_xml_declaration(xml_bytes: bytes) -> bool:
+    return xml_bytes.lstrip().startswith(b"<?xml")
 
 
 def restore_root_namespace_declarations(
@@ -346,19 +652,20 @@ def insert_merge_cells_element(worksheet_root: ET.Element, merge_cells: ET.Eleme
 
 
 def update_dimension(worksheet_root: ET.Element, sheet_data: ET.Element, plan: FillPlan) -> None:
-    bounds = existing_dimension_bounds(worksheet_root)
-    if bounds is None:
+    if plan.deleted_row_indices:
         bounds = scan_sheet_data_bounds(sheet_data)
+        bounds = expand_bounds_with_existing_merge_ranges(bounds, worksheet_root)
+    else:
+        bounds = existing_dimension_bounds(worksheet_root)
+        if bounds is None:
+            bounds = scan_sheet_data_bounds(sheet_data)
 
     for cell_write in plan.cell_writes:
         bounds = expand_bounds(bounds, row=cell_write.row, column=cell_write.column)
     for merged_range in plan.merged_ranges:
         bounds = expand_bounds_with_range(bounds, parse_range(merged_range))
 
-    if bounds is None:
-        return
-
-    ref = format_dimension(bounds)
+    ref = "A1" if bounds is None else format_dimension(bounds)
     dimension = worksheet_root.find("main:dimension", SHEET_NAMESPACES)
     if dimension is None:
         dimension = ET.Element(sheet_tag("dimension"), {"ref": ref})
@@ -406,6 +713,22 @@ def scan_sheet_data_bounds(sheet_data: ET.Element) -> tuple[int, int, int, int] 
                 row=row_index,
                 column=coordinate_column_index(coordinate),
             )
+    return bounds
+
+
+def expand_bounds_with_existing_merge_ranges(
+    bounds: tuple[int, int, int, int] | None,
+    worksheet_root: ET.Element,
+) -> tuple[int, int, int, int] | None:
+    merge_cells = worksheet_root.find("main:mergeCells", SHEET_NAMESPACES)
+    if merge_cells is None:
+        return bounds
+
+    for merge_cell in merge_cells.findall(sheet_tag("mergeCell")):
+        reference = merge_cell.attrib.get("ref")
+        if not reference:
+            continue
+        bounds = expand_bounds_with_range(bounds, parse_range(reference))
     return bounds
 
 
@@ -466,6 +789,120 @@ def update_row_spans(row_element: ET.Element) -> None:
     row_element.set("spans", f"{min(columns)}:{max(columns)}")
 
 
+def shift_range_bounds(
+    reference: str,
+    deleted_row_indices: tuple[int, ...],
+) -> tuple[int, int, int, int] | None:
+    try:
+        cell_range = parse_range(reference)
+    except ValueError:
+        return None
+
+    first_surviving_row: int | None = None
+    last_surviving_row: int | None = None
+    for row_index in range(cell_range.min_row, cell_range.max_row + 1):
+        if shift_row_number(row_index, deleted_row_indices) is None:
+            continue
+        first_surviving_row = row_index
+        break
+
+    if first_surviving_row is None:
+        return None
+
+    for row_index in range(cell_range.max_row, cell_range.min_row - 1, -1):
+        if shift_row_number(row_index, deleted_row_indices) is None:
+            continue
+        last_surviving_row = row_index
+        break
+
+    assert last_surviving_row is not None
+    shifted_min_row = shift_row_number(first_surviving_row, deleted_row_indices)
+    shifted_max_row = shift_row_number(last_surviving_row, deleted_row_indices)
+    assert shifted_min_row is not None
+    assert shifted_max_row is not None
+
+    return (
+        shifted_min_row,
+        cell_range.min_col,
+        shifted_max_row,
+        cell_range.max_col,
+    )
+
+
+def format_range_bounds(bounds: tuple[int, int, int, int]) -> str:
+    min_row, min_col, max_row, max_col = bounds
+    start = f"{get_column_letter(min_col)}{min_row}"
+    end = f"{get_column_letter(max_col)}{max_row}"
+    return start if start == end else f"{start}:{end}"
+
+
+def range_is_single_cell(bounds: tuple[int, int, int, int]) -> bool:
+    min_row, min_col, max_row, max_col = bounds
+    return min_row == max_row and min_col == max_col
+
+
+def shift_single_coordinate(coordinate: str, deleted_row_indices: tuple[int, ...]) -> str | None:
+    column_letters, row_index = coordinate_from_string(coordinate)
+    shifted_row = shift_row_number(row_index, deleted_row_indices)
+    if shifted_row is None:
+        return None
+    return f"{column_letters}{shifted_row}"
+
+
+def shift_row_number(row_index: int, deleted_row_indices: tuple[int, ...]) -> int | None:
+    insertion_point = bisect_left(deleted_row_indices, row_index)
+    if insertion_point < len(deleted_row_indices) and deleted_row_indices[insertion_point] == row_index:
+        return None
+    return row_index - insertion_point
+
+
+def shift_zero_based_row_marker(
+    row_marker: int,
+    deleted_row_indices: tuple[int, ...],
+) -> int | None:
+    row_index = row_marker + 1
+    deleted_before_or_at = bisect_right(deleted_row_indices, row_index)
+    shifted_row = row_index - deleted_before_or_at
+    if shifted_row < 1:
+        return None
+    return shifted_row - 1
+
+
+def shift_vml_anchor(anchor_text: str, deleted_row_indices: tuple[int, ...]) -> str:
+    values = [part.strip() for part in anchor_text.split(",")]
+    for row_position in (2, 6):
+        if row_position >= len(values):
+            continue
+        row_value = safe_int(values[row_position])
+        if row_value is None:
+            continue
+        shifted_row = shift_zero_based_row_marker(row_value, deleted_row_indices)
+        values[row_position] = str(0 if shifted_row is None else shifted_row)
+    return ", ".join(values)
+
+
+def shift_drawing_marker(
+    marker: ET.Element | None,
+    deleted_row_indices: tuple[int, ...],
+) -> int | None:
+    if marker is None:
+        return None
+
+    row_element = marker.find("xdr:row", DRAWING_NAMESPACES)
+    if row_element is None or row_element.text is None:
+        return None
+
+    row_value = safe_int(row_element.text)
+    if row_value is None:
+        return None
+
+    shifted_row = shift_zero_based_row_marker(row_value, deleted_row_indices)
+    if shifted_row is None:
+        shifted_row = 0
+    row_element.text = str(shifted_row)
+    return shifted_row
+
+
 def coordinate_column_index(coordinate: str) -> int:
     column_letters, _ = coordinate_from_string(coordinate)
     return column_index_from_string(column_letters)
@@ -482,6 +919,14 @@ def sheet_tag(local_name: str) -> str:
 
 def package_relationship_tag(local_name: str) -> str:
     return f"{{{PACKAGE_REL_NS}}}{local_name}"
+
+
+def vml_tag(local_name: str) -> str:
+    return f"{{{VML_NS}}}{local_name}"
+
+
+def excel_vml_tag(local_name: str) -> str:
+    return f"{{{EXCEL_VML_NS}}}{local_name}"
 
 
 def local_name(tag: str) -> str:

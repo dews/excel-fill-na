@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from excel_fill_na.cli import main
@@ -81,3 +82,58 @@ def test_cli_preserves_fixture_artifacts(tmp_path: Path, capsys) -> None:
     assert cell_attributes["vm"] == "1"
     assert cell_value == "#VALUE!"
     assert "filled 2 empty cells" in captured.out
+
+
+def test_cli_deletes_empty_rows(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "delete-cli.xlsx"
+    output = tmp_path / "delete-cli.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["A2"] = "keep"
+    workbook.save(source)
+    workbook.close()
+
+    exit_code = main(
+        [
+            str(source),
+            "--sheet",
+            "Data",
+            "--range",
+            "A1:A2",
+            "--delete-empty-rows",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+    captured = capsys.readouterr()
+
+    assert output_worksheet["A1"].value == "keep"
+    assert "deleted 1 empty row" in captured.out
+    output_workbook.close()
+
+
+def test_cli_rejects_delete_mode_with_merge_mode(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["input.xlsx", "--range", "A1:A2", "--delete-empty-rows", "--merge-empty-runs"])
+
+    captured = capsys.readouterr()
+
+    assert excinfo.value.code == 2
+    assert "--delete-empty-rows cannot be combined with --merge-empty-runs" in captured.err
+
+
+def test_cli_rejects_delete_mode_with_explicit_fill_text(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["input.xlsx", "--range", "A1:A2", "--delete-empty-rows", "--fill-text", "NA"])
+
+    captured = capsys.readouterr()
+
+    assert excinfo.value.code == 2
+    assert "--delete-empty-rows cannot be combined with --fill-text" in captured.err

@@ -53,6 +53,47 @@ def build_fill_plan(
     )
 
 
+def build_delete_plan(
+    worksheet: Worksheet,
+    *,
+    target_range: str,
+    excluded_ranges: Iterable[str] | None = None,
+    fill_value: str = DEFAULT_FILL_VALUE,
+    preserved_coordinates: set[tuple[int, int]] | None = None,
+) -> FillPlan:
+    target = parse_range(target_range)
+    exclusions = parse_ranges(excluded_ranges)
+    protected_coordinates = preserved_coordinates or set()
+    merge_lookup = build_merge_lookup(worksheet)
+    deleted_rows: list[int] = []
+
+    for row in range(target.min_row, target.max_row + 1):
+        if row_intersects_excluded_range(
+            row=row,
+            target=target,
+            exclusions=exclusions,
+        ):
+            continue
+        if is_deletable_row(
+            worksheet=worksheet,
+            row=row,
+            target=target,
+            merge_lookup=merge_lookup,
+            preserved_coordinates=protected_coordinates,
+        ):
+            deleted_rows.append(row)
+
+    return FillPlan(
+        sheet_name=worksheet.title,
+        target_range=target.coord,
+        fill_value=str(fill_value),
+        filled_cells=0,
+        merged_ranges=(),
+        cell_writes=(),
+        deleted_row_indices=tuple(deleted_rows),
+    )
+
+
 def apply_fill_plan_to_worksheet(worksheet: Worksheet, plan: FillPlan) -> None:
     for merged_range in plan.merged_ranges:
         worksheet.merge_cells(merged_range)
@@ -204,6 +245,70 @@ def build_merge_lookup(worksheet: Worksheet) -> dict[tuple[int, int], tuple[int,
             for column in range(merged_range.min_col, merged_range.max_col + 1):
                 lookup[(row, column)] = anchor
     return lookup
+
+
+def is_deletable_row(
+    worksheet: Worksheet,
+    *,
+    row: int,
+    target: CellRange,
+    merge_lookup: dict[tuple[int, int], tuple[int, int]],
+    preserved_coordinates: set[tuple[int, int]],
+) -> bool:
+    for column in range(target.min_col, target.max_col + 1):
+        if not is_logically_empty_coordinate(
+            worksheet=worksheet,
+            row=row,
+            column=column,
+            merge_lookup=merge_lookup,
+            preserved_coordinates=preserved_coordinates,
+        ):
+            return False
+    return True
+
+
+def is_logically_empty_coordinate(
+    worksheet: Worksheet,
+    *,
+    row: int,
+    column: int,
+    merge_lookup: dict[tuple[int, int], tuple[int, int]],
+    preserved_coordinates: set[tuple[int, int]],
+) -> bool:
+    anchor_row, anchor_column = merge_lookup.get((row, column), (row, column))
+    if anchor_row != row:
+        return True
+    if (row, column) in preserved_coordinates or (anchor_row, anchor_column) in preserved_coordinates:
+        return False
+
+    cell = worksheet.cell(row=anchor_row, column=anchor_column)
+    return is_empty(cell.value) and not has_preserved_comment(cell)
+
+
+def row_intersects_excluded_range(
+    *,
+    row: int,
+    target: CellRange,
+    exclusions: tuple[CellRange, ...],
+) -> bool:
+    for exclusion in exclusions:
+        if exclusion.min_row <= row <= exclusion.max_row and ranges_overlap(
+            target.min_col,
+            target.max_col,
+            exclusion.min_col,
+            exclusion.max_col,
+        ):
+            return True
+    return False
+
+
+def ranges_overlap(
+    start_a: int,
+    end_a: int,
+    start_b: int,
+    end_b: int,
+) -> bool:
+    return start_a <= end_b and start_b <= end_a
 
 
 def is_empty(value: object) -> bool:

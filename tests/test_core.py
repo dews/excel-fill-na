@@ -4,9 +4,22 @@ from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
+from openpyxl.utils.cell import coordinate_from_string
 
+from excel_fill_na._archive import find_value_metadata_cells, resolve_worksheet_archive_path
+from excel_fill_na._planning import build_delete_plan
 from excel_fill_na.core import fill_empty_cells, process_workbook
-from conftest import FIXTURE_PATH, artifact_payloads, root_namespace_declarations, worksheet_cell_xml
+from conftest import (
+    FIXTURE_PATH,
+    artifact_payloads,
+    comment_refs,
+    drawing_anchor_rows,
+    root_namespace_declarations,
+    threaded_comment_refs,
+    worksheet_cell_xml,
+    worksheet_hyperlink_refs,
+    worksheet_merge_refs,
+)
 
 
 def _write_comment_only_workbook(path: Path) -> None:
@@ -88,6 +101,25 @@ def _write_value_metadata_only_workbook(path: Path) -> None:
                 destination_archive.writestr(info, data)
 
     base.unlink()
+
+
+def _shift_coordinate_after_deleting_rows(
+    coordinate: str,
+    deleted_rows: tuple[int, ...],
+) -> str:
+    column_letters, row_index = coordinate_from_string(coordinate)
+    shifted_row = row_index - sum(1 for deleted_row in deleted_rows if deleted_row < row_index)
+    return f"{column_letters}{shifted_row}"
+
+
+def _shift_zero_based_anchor_after_deleting_rows(
+    row_index: int | None,
+    deleted_rows: tuple[int, ...],
+) -> int | None:
+    if row_index is None:
+        return None
+    shifted_row = row_index - sum(1 for deleted_row in deleted_rows if deleted_row <= row_index + 1)
+    return max(0, shifted_row)
 
 
 def test_fill_empty_cells_only_in_selected_range() -> None:
@@ -310,3 +342,286 @@ def test_process_workbook_does_not_fill_value_metadata_cells(tmp_path: Path) -> 
     assert cell_attributes["vm"] == "1"
     assert cell_value is None
     assert output_worksheet["A3"].value == "stop"
+
+
+def test_process_workbook_deletes_rows_empty_within_selected_range(tmp_path: Path) -> None:
+    source = tmp_path / "delete-selected-range.xlsx"
+    output = tmp_path / "delete-selected-range.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["C1"] = "outside-target"
+    worksheet["A2"] = "keep"
+    worksheet["A3"] = "   "
+    worksheet["C3"] = "outside-target-2"
+    worksheet["A4"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:B4",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 2
+    assert result.filled_cells == 0
+    assert result.merged_ranges == ()
+    assert output_worksheet["A1"].value == "keep"
+    assert output_worksheet["A2"].value == "stop"
+    assert output_worksheet["C1"].value is None
+    assert output_worksheet["C2"].value is None
+    output_workbook.close()
+
+
+def test_process_workbook_keeps_comment_rows_in_delete_mode(tmp_path: Path) -> None:
+    source = tmp_path / "delete-comments.xlsx"
+    output = tmp_path / "delete-comments.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["A2"].comment = Comment("note", "tester")
+    worksheet["A3"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:A3",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 1
+    assert output_worksheet["A1"].value is None
+    assert output_worksheet["A1"].comment is not None
+    assert output_worksheet["A1"].comment.text == "note"
+    assert output_worksheet["A2"].value == "stop"
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_protects_rows_intersecting_exclusions(tmp_path: Path) -> None:
+    source = tmp_path / "delete-excluded.xlsx"
+    output = tmp_path / "delete-excluded.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["A2"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:B2",
+        excluded_ranges=["B1"],
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 0
+    assert output_worksheet["A1"].value is None
+    assert output_worksheet["A2"].value == "stop"
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_preserves_non_empty_merged_anchor_rows(tmp_path: Path) -> None:
+    source = tmp_path / "delete-merged-keep.xlsx"
+    output = tmp_path / "delete-merged-keep.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.merge_cells("A1:B1")
+    worksheet["A1"] = "keep"
+    worksheet["A3"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:B3",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 1
+    assert output_worksheet["A1"].value == "keep"
+    assert output_worksheet["A2"].value == "stop"
+    assert worksheet_merge_refs(output) == ["A1:B1"]
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_ignores_cross_row_merged_coverage(tmp_path: Path) -> None:
+    source = tmp_path / "delete-merged-cross-row.xlsx"
+    output = tmp_path / "delete-merged-cross-row.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.merge_cells("E1:E3")
+    worksheet["E1"] = "keep-on-row-1"
+    worksheet["A4"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:E4",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 2
+    assert output_worksheet["E1"].value == "keep-on-row-1"
+    assert output_worksheet["A2"].value == "stop"
+    assert worksheet_merge_refs(output) == []
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_removes_fully_empty_merged_rows(tmp_path: Path) -> None:
+    source = tmp_path / "delete-merged-empty.xlsx"
+    output = tmp_path / "delete-merged-empty.output.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.merge_cells("A1:B1")
+    worksheet["A2"] = "stop"
+    workbook.save(source)
+    workbook.close()
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:B2",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert result.deleted_rows == 1
+    assert output_worksheet["A1"].value == "stop"
+    assert worksheet_merge_refs(output) == []
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_preserves_value_metadata_cells(tmp_path: Path) -> None:
+    source = tmp_path / "delete-value-metadata.xlsx"
+    output = tmp_path / "delete-value-metadata.output.xlsx"
+    _write_value_metadata_only_workbook(source)
+
+    result = process_workbook(
+        source,
+        sheet_name="Data",
+        target_range="A1:A3",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+    cell_attributes, cell_value = worksheet_cell_xml(output, "A1")
+
+    assert result.deleted_rows == 1
+    assert cell_attributes["vm"] == "1"
+    assert cell_value is None
+    assert output_worksheet["A1"].value is None
+    assert output_worksheet["A2"].value == "stop"
+    output_workbook.close()
+
+
+def test_process_workbook_delete_mode_shifts_sheet_owned_artifacts(tmp_path: Path) -> None:
+    output = tmp_path / "delete-fixture-output.xlsx"
+
+    source_workbook = load_workbook(FIXTURE_PATH)
+    source_worksheet = source_workbook["Data"]
+    source_image_count = len(getattr(source_worksheet, "_images", []))
+    source_chart_count = len(getattr(source_worksheet, "_charts", []))
+    source_deleted_rows = build_delete_plan(
+        source_worksheet,
+        target_range="D2:D6",
+        preserved_coordinates=find_value_metadata_cells(
+            FIXTURE_PATH,
+            resolve_worksheet_archive_path(FIXTURE_PATH, source_worksheet.title),
+        ),
+    ).deleted_row_indices
+    source_hyperlink_ref = worksheet_hyperlink_refs(FIXTURE_PATH)[0]
+    source_hyperlink = source_worksheet[source_hyperlink_ref].hyperlink.target
+    source_workbook.close()
+    source_comment_ref = comment_refs(FIXTURE_PATH)[0]
+    source_threaded_comment_ref = threaded_comment_refs(FIXTURE_PATH)[0]
+    source_anchor_rows = drawing_anchor_rows(FIXTURE_PATH)
+    expected_hyperlink_ref = _shift_coordinate_after_deleting_rows(
+        source_hyperlink_ref,
+        source_deleted_rows,
+    )
+
+    result = process_workbook(
+        FIXTURE_PATH,
+        sheet_name="Data",
+        target_range="D2:D6",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    assert result.deleted_rows == len(source_deleted_rows)
+    assert result.filled_cells == 0
+    assert result.merged_ranges == ()
+
+    output_workbook = load_workbook(output)
+    output_worksheet = output_workbook["Data"]
+
+    assert output_worksheet[expected_hyperlink_ref].hyperlink is not None
+    assert output_worksheet[expected_hyperlink_ref].hyperlink.target == source_hyperlink
+    assert len(getattr(output_worksheet, "_images", [])) == source_image_count
+    assert len(getattr(output_worksheet, "_charts", [])) == source_chart_count
+    output_workbook.close()
+
+    output_artifacts = artifact_payloads(output)
+    assert set(output_artifacts) == set(artifact_payloads(FIXTURE_PATH))
+    assert root_namespace_declarations(output) == root_namespace_declarations(FIXTURE_PATH)
+    assert worksheet_hyperlink_refs(output) == [expected_hyperlink_ref]
+    assert comment_refs(output) == [
+        _shift_coordinate_after_deleting_rows(source_comment_ref, source_deleted_rows)
+    ]
+    assert threaded_comment_refs(output) == [
+        _shift_coordinate_after_deleting_rows(source_threaded_comment_ref, source_deleted_rows)
+    ]
+    assert drawing_anchor_rows(output) == [
+        (
+            anchor_type,
+            _shift_zero_based_anchor_after_deleting_rows(from_row, source_deleted_rows),
+            _shift_zero_based_anchor_after_deleting_rows(to_row, source_deleted_rows),
+        )
+        for anchor_type, from_row, to_row in source_anchor_rows
+    ]
+    cell_attributes, cell_value = worksheet_cell_xml(output, "D2")
+    assert cell_attributes["t"] == "e"
+    assert cell_attributes["vm"] == "1"
+    assert cell_value == "#VALUE!"

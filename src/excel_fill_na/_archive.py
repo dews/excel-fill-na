@@ -26,11 +26,17 @@ VML_NS = "urn:schemas-microsoft-com:vml"
 EXCEL_VML_NS = "urn:schemas-microsoft-com:office:excel"
 THREADED_COMMENTS_NS = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"
 THREADED_COMMENT_REL_NS = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 COMMENTS_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/comments"
 DRAWING_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/drawing"
 VML_DRAWING_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/vmlDrawing"
+CALC_CHAIN_REL_TYPE = f"{OFFICE_DOCUMENT_REL_NS}/calcChain"
+CALC_CHAIN_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"
+CALC_CHAIN_PATH = "xl/calcChain.xml"
+CONTENT_TYPES_PATH = "[Content_Types].xml"
+WORKBOOK_RELS_PATH = "xl/_rels/workbook.xml.rels"
 
 SHEET_NAMESPACES = {"main": SPREADSHEETML_NS}
 WORKBOOK_NAMESPACES = {
@@ -39,6 +45,7 @@ WORKBOOK_NAMESPACES = {
     "rels": PACKAGE_REL_NS,
 }
 DRAWING_NAMESPACES = {"xdr": DRAWINGML_NS}
+CONTENT_TYPES_NAMESPACES = {"ct": CONTENT_TYPES_NS}
 
 
 def persist_workbook_changes(
@@ -161,7 +168,7 @@ def write_patched_archive(
     plan: FillPlan,
 ) -> None:
     with ZipFile(source) as source_archive:
-        patched_parts = build_archive_patches(
+        patched_parts, removed_parts = build_archive_patches(
             source_archive=source_archive,
             worksheet_path=worksheet_path,
             plan=plan,
@@ -169,6 +176,8 @@ def write_patched_archive(
 
         with ZipFile(destination, "w") as destination_archive:
             for info in source_archive.infolist():
+                if info.filename in removed_parts:
+                    continue
                 data = patched_parts.get(info.filename, source_archive.read(info.filename))
                 destination_archive.writestr(info, data)
 
@@ -178,13 +187,14 @@ def build_archive_patches(
     source_archive: ZipFile,
     worksheet_path: str,
     plan: FillPlan,
-) -> dict[str, bytes]:
+) -> tuple[dict[str, bytes], set[str]]:
     patched_parts = {
         worksheet_path: patch_worksheet_xml(source_archive.read(worksheet_path), plan),
     }
+    removed_parts: set[str] = set()
 
     if not plan.deleted_row_indices:
-        return patched_parts
+        return patched_parts, removed_parts
 
     related_part_paths = resolve_related_part_paths(source_archive, worksheet_path)
     for path in related_part_paths.get(COMMENTS_REL_TYPE, ()):
@@ -196,7 +206,16 @@ def build_archive_patches(
     for path in related_part_paths.get(DRAWING_REL_TYPE, ()):
         patched_parts[path] = patch_drawing_xml(source_archive.read(path), plan.deleted_row_indices)
 
-    return patched_parts
+    if CALC_CHAIN_PATH in source_archive.namelist():
+        removed_parts.add(CALC_CHAIN_PATH)
+        patched_parts[CONTENT_TYPES_PATH] = patch_content_types_remove_calc_chain(
+            source_archive.read(CONTENT_TYPES_PATH)
+        )
+        patched_parts[WORKBOOK_RELS_PATH] = patch_workbook_relationships_remove_calc_chain(
+            source_archive.read(WORKBOOK_RELS_PATH)
+        )
+
+    return patched_parts, removed_parts
 
 
 def resolve_related_part_paths(source_archive: ZipFile, worksheet_path: str) -> dict[str, tuple[str, ...]]:
@@ -309,6 +328,40 @@ def patch_threaded_comments_xml(
         threaded_root,
         namespaces,
         xml_declaration=has_xml_declaration(threaded_comments_xml),
+    )
+
+
+def patch_content_types_remove_calc_chain(content_types_xml: bytes) -> bytes:
+    content_types_root, namespaces = parse_xml_bytes(content_types_xml)
+    register_namespaces(namespaces)
+
+    for override in list(content_types_root.findall("ct:Override", CONTENT_TYPES_NAMESPACES)):
+        if override.attrib.get("PartName") != f"/{CALC_CHAIN_PATH}":
+            continue
+        if override.attrib.get("ContentType") != CALC_CHAIN_CONTENT_TYPE:
+            continue
+        content_types_root.remove(override)
+
+    return serialize_xml(
+        content_types_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(content_types_xml),
+    )
+
+
+def patch_workbook_relationships_remove_calc_chain(workbook_rels_xml: bytes) -> bytes:
+    relationships_root, namespaces = parse_xml_bytes(workbook_rels_xml)
+    register_namespaces(namespaces)
+
+    for relationship in list(relationships_root.findall(package_relationship_tag("Relationship"))):
+        if relationship.attrib.get("Type") != CALC_CHAIN_REL_TYPE:
+            continue
+        relationships_root.remove(relationship)
+
+    return serialize_xml(
+        relationships_root,
+        namespaces,
+        xml_declaration=has_xml_declaration(workbook_rels_xml),
     )
 
 

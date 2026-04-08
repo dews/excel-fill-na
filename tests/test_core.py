@@ -625,3 +625,30 @@ def test_process_workbook_delete_mode_shifts_sheet_owned_artifacts(tmp_path: Pat
     assert cell_attributes["t"] == "e"
     assert cell_attributes["vm"] == "1"
     assert cell_value == "#VALUE!"
+
+
+def test_process_workbook_delete_mode_removes_stale_calc_chain(tmp_path: Path) -> None:
+    output = tmp_path / "delete-fixture-no-calc-chain.xlsx"
+
+    result = process_workbook(
+        FIXTURE_PATH,
+        sheet_name="Data",
+        target_range="A1:E10",
+        delete_empty_rows=True,
+        output_path=output,
+    )
+
+    assert result.deleted_rows >= 1
+
+    with ZipFile(output) as archive:
+        names = set(archive.namelist())
+        assert "xl/calcChain.xml" not in names
+        workbook_rels = archive.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        content_types = archive.read("[Content_Types].xml").decode("utf-8")
+
+    assert "relationships/calcChain" not in workbook_rels
+    assert "spreadsheetml.calcChain+xml" not in content_types
+
+    reloaded = load_workbook(output)
+    assert reloaded.sheetnames == ["Data", "Other"]
+    reloaded.close()
